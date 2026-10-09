@@ -23,7 +23,7 @@ Override with `--user` or `--system` at any time.
 ## Quick start
 
 ```bash
-cd ~/"Command Code"
+cd ~/Projects/CommandCodeDesktop-FedoraInstaller
 ./install-command-code.sh                 # newest CommandCode-*.deb in ~/Downloads
 ```
 
