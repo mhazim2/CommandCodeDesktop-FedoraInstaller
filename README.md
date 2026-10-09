@@ -36,13 +36,28 @@ Specific file, or a forced scope:
 ./install-command-code.sh --deb /path/to/CommandCode-x.y.z-amd64.deb
 ./install-command-code.sh --user          # force per-user
 ./install-command-code.sh --system        # force system-wide (sudo)
+./install-command-code.sh --download      # fetch the latest .deb and install it
 ```
+
+If there's **no `.deb` in `~/Downloads`**, the installer offers to download the
+newest release from GitHub (`CommandCodeAI/desktop`) into `~/Downloads` and
+continues with it. The prompt shows the version and size, and defaults to yes:
+
+```
+No .deb found in ~/Downloads. Download CommandCode-0.1.51-amd64.deb (v0.1.51 latest, ~120 MB) now? [Y/n]
+```
+
+It fetches the release's `latest-linux.yml` to learn the exact filename and
+**sha512**, verifies the download against it, then installs. In a
+non-interactive context (no terminal) it won't prompt — use `--download` to
+fetch the latest without asking, or it fails with a hint.
 
 Flags:
 
 | Flag | Meaning |
 | --- | --- |
 | `--user` / `--system` | force the install scope |
+| `--download` | download the latest `.deb` from GitHub and install it (no prompt) |
 | `--no-verify` | skip the md5 integrity check |
 | `--force` | install even if shared libraries are missing |
 | `--no-pause` | never wait for Enter when something fails |

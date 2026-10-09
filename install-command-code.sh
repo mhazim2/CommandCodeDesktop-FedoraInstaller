@@ -48,10 +48,17 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME_DIR/.local/share}"
 DOWNLOAD_DIR="$HOME_DIR/Downloads"
 OVERLAY_PKGS_LIST="/var/lib/rakuos/packages.list"
 
+# Upstream release feed (Electron-builder latest-linux.yml lists the .deb with
+# its filename, size and sha512).
+DEB_UPSTREAM_REPO="CommandCodeAI/desktop"
+RELEASE_META_URL="https://github.com/$DEB_UPSTREAM_REPO/releases/latest/download/latest-linux.yml"
+RELEASE_DL_BASE="https://github.com/$DEB_UPSTREAM_REPO/releases/latest/download"
+
 DEB=""
 DO_UNINSTALL=0
 VERIFY=1
 FORCE=0
+AUTO_DOWNLOAD=0
 NO_PAUSE="${CC_NO_PAUSE:-0}"
 SCOPE=""          # user | system ; empty = auto-detect
 SUDO=""           # set to "sudo" when a system install needs elevation
@@ -140,6 +147,14 @@ if [ -r /etc/os-release ]; then
 	OS_PRETTY="${PRETTY_NAME:-${NAME:-unknown}}"
 fi
 
+host_machine="$(uname -m)"
+case "$host_machine" in
+	x86_64)  host_deb_arch="amd64" ;;
+	aarch64) host_deb_arch="arm64" ;;
+	i386|i686) host_deb_arch="i386" ;;
+	*)       host_deb_arch="$host_machine" ;;
+esac
+
 # Immutable = /usr is read-only and managed as an image (ostree/bootc).
 is_immutable() {
 	[ -e /run/ostree-booted ] && return 0
@@ -214,6 +229,101 @@ userns_ok() {
 	fi
 }
 
+# ---- downloading the latest release ------------------------------------------
+# Fetch URL -> FILE using curl or wget.
+fetch() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -q --tries=3 -O "$2" "$1"
+	else
+		return 127
+	fi
+}
+
+# Base64 of a file's sha512 (matches the value published in latest-linux.yml).
+sha512_b64() {
+	if command -v openssl >/dev/null 2>&1; then
+		openssl dgst -sha512 -binary "$1" | base64 -w0 2>/dev/null
+	elif command -v sha512sum >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
+		sha512sum "$1" | awk '{print $1}' | xxd -r -p | base64 -w0 2>/dev/null
+	else
+		return 1
+	fi
+}
+
+# Prompt on the controlling terminal (defaults to yes). Non-interactive -> no.
+ask_yes_no() {
+	local ans
+	[ "$NO_PAUSE" = 1 ] && return 1
+	( exec </dev/tty ) 2>/dev/null || return 1
+	printf '%s [Y/n] ' "$1" >&2
+	read -r ans < /dev/tty 2>/dev/null || return 1
+	case "$ans" in ''|y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# Download the newest published .deb into $DOWNLOAD_DIR.
+#   $1 = "force" (skip prompt) or "ask" (prompt first)
+# On success prints the path on stdout; messages go to stderr.
+download_latest_deb() {
+	local mode="${1:-ask}" meta deb_name ver url dest sha size human got
+	if [ "$host_deb_arch" != amd64 ]; then
+		warn "no .deb is published for this host ($host_deb_arch); upstream ships a linux x86_64 .deb only"
+		return 1
+	fi
+	if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+		warn "need curl or wget to download the .deb"
+		return 1
+	fi
+
+	meta="$TMP/latest-linux.yml"
+	if ! fetch "$RELEASE_META_URL" "$meta"; then
+		warn "could not fetch release metadata ($RELEASE_META_URL)"
+		return 1
+	fi
+	ver="$(sed -n 's/^version: *//p' "$meta" | head -n1 || true)"
+	deb_name="$(grep -oE 'CommandCode-[^ ]+-amd64\.deb' "$meta" | head -n1 || true)"
+	if [ -z "$deb_name" ]; then
+		warn "no linux .deb is listed in the latest release"
+		return 1
+	fi
+	sha="$(awk -v n="$deb_name" '$1=="-"&&$2=="url:"{c=$3} c==n&&$1=="sha512:"{print $2; exit}' "$meta" || true)"
+	size="$(awk -v n="$deb_name" '$1=="-"&&$2=="url:"{c=$3} c==n&&$1=="size:"{print $2; exit}' "$meta" || true)"
+
+	if [ "$mode" = ask ]; then
+		human=""
+		[ -n "$size" ] && human=", ~$(( size / 1048576 )) MB"
+		if ! ask_yes_no "No .deb found in $DOWNLOAD_DIR. Download $deb_name (${ver:+v$ver }latest$human) now?"; then
+			return 2
+		fi
+	fi
+
+	mkdir -p "$DOWNLOAD_DIR"
+	dest="$DOWNLOAD_DIR/$deb_name"
+	url="$RELEASE_DL_BASE/$deb_name"
+	note "downloading $deb_name ..." >&2
+	if ! fetch "$url" "$dest.part"; then
+		warn "download failed"
+		rm -f "$dest.part"
+		return 3
+	fi
+
+	if [ -n "$sha" ]; then
+		if got="$(sha512_b64 "$dest.part")"; then
+			if [ "$got" != "$sha" ]; then
+				warn "downloaded file failed its sha512 check (corrupt/partial download)"
+				rm -f "$dest.part"
+				return 3
+			fi
+		else
+			warn "could not verify sha512 (openssl/base64 missing) — continuing"
+		fi
+	fi
+
+	mv -f "$dest.part" "$dest"
+	printf '%s' "$dest"
+}
+
 usage() {
 	resolve_scope
 	cat <<EOF
@@ -229,6 +339,7 @@ Usage:
 Options:
   --user        install per-user under ~/.local (no root)
   --system      install system-wide under /usr/local (uses sudo)
+  --download    download the latest .deb from GitHub and install it (no prompt)
   --no-verify   skip the md5 integrity check
   --force       install even if shared libraries are missing
   --no-pause    do not wait for Enter when something fails
@@ -369,6 +480,7 @@ while [ "$#" -gt 0 ]; do
 		--uninstall)  DO_UNINSTALL=1; shift ;;
 		--user)       SCOPE=user; shift ;;
 		--system)     SCOPE=system; shift ;;
+		--download)   AUTO_DOWNLOAD=1; shift ;;
 		--deb)        [ "$#" -ge 2 ] || fail "--deb requires a path" ; DEB="$2"; shift 2 ;;
 		--no-verify)  VERIFY=0; shift ;;
 		--force)      FORCE=1; shift ;;
@@ -389,23 +501,42 @@ fi
 
 prepare_privileges
 
+TMP="$(mktemp -d)"
+
 # ---- locate the .deb ---------------------------------------------------------
 if [ -z "$DEB" ]; then
-	shopt -s nullglob
-	candidates=( "$DOWNLOAD_DIR"/$DOWNLOAD_GLOB )
-	shopt -u nullglob
-	if [ "${#candidates[@]}" -eq 0 ]; then
-		fail "no matching .deb found in $DOWNLOAD_DIR" \
-			"Looked for: $DOWNLOAD_GLOB" \
-			"Download a new Command Code .deb, or pass a path explicitly."
-	fi
-	newest=""
-	for f in "${candidates[@]}"; do
-		if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then
-			newest="$f"
+	if [ "$AUTO_DOWNLOAD" -eq 1 ]; then
+		dest="$(download_latest_deb force)" || dest=""
+		if [ -z "$dest" ]; then
+			fail "could not download the latest .deb" \
+				"Check your network connection, or download it manually and pass a path."
 		fi
-	done
-	DEB="$newest"
+		DEB="$dest"
+		log "downloaded: $DEB"
+	else
+		shopt -s nullglob
+		candidates=( "$DOWNLOAD_DIR"/$DOWNLOAD_GLOB )
+		shopt -u nullglob
+		if [ "${#candidates[@]}" -eq 0 ]; then
+			# Nothing downloaded yet — offer to fetch the latest release.
+			if dest="$(download_latest_deb ask)"; then
+				DEB="$dest"
+				log "downloaded: $DEB"
+			else
+				fail "no matching .deb found in $DOWNLOAD_DIR" \
+					"Looked for: $DOWNLOAD_GLOB" \
+					"Download it manually, pass a path, or re-run with --download."
+			fi
+		else
+			newest=""
+			for f in "${candidates[@]}"; do
+				if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then
+					newest="$f"
+				fi
+			done
+			DEB="$newest"
+		fi
+	fi
 fi
 
 # ---- preflight: the file and the tools --------------------------------------
@@ -422,8 +553,6 @@ log "$DEB"
 if is_immutable; then host_kind="immutable image"; else host_kind="mutable host"; fi
 note "host: ${OS_PRETTY:-unknown} ($host_kind) — scope: $SCOPE"
 [ "$SCOPE" = system ] && note "elevating with sudo as needed (target: /usr/local)"
-
-TMP="$(mktemp -d)"
 
 # ---- unpack the outer ar archive --------------------------------------------
 if ! members="$( cd "$TMP" && ar t "$DEB" 2>/dev/null )"; then
@@ -459,13 +588,6 @@ fi
 [ -n "$pkg_version" ] && log "version: $pkg_version"
 
 # architecture guard
-host_machine="$(uname -m)"
-case "$host_machine" in
-	x86_64)  host_deb_arch="amd64" ;;
-	aarch64) host_deb_arch="arm64" ;;
-	i386|i686) host_deb_arch="i386" ;;
-	*)       host_deb_arch="$host_machine" ;;
-esac
 if [ -n "$arch" ] && [ "$arch" != "all" ] && [ "$arch" != "$host_deb_arch" ]; then
 	fail "wrong architecture: the package is '$arch' but this host is '$host_deb_arch' ($host_machine)" \
 		"Download the '$host_deb_arch' build instead."
