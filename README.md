@@ -1,5 +1,7 @@
 # Command Code installer (Fedora-family, multi-distro)
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 A self-contained, idempotent installer for the **Command Code** desktop app
 (Electron). Upstream ships a Debian `.deb`; this unpacks it directly (a `.deb`
 is just an `ar` archive containing `control.tar.*` + `data.tar.*`) and installs
@@ -215,3 +217,10 @@ removed on exit, and nothing is swapped into place until every check passes.
 
 - `install-command-code.sh` — the idempotent installer (install / update / uninstall).
 - `README.md` — this document.
+- `LICENSE` — MIT.
+
+## License
+
+MIT — see [LICENSE](LICENSE). This covers the installer script in this
+repository; the Command Code app it installs remains under its own upstream
+license.
