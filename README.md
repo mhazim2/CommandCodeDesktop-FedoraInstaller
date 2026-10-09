@@ -204,7 +204,10 @@ refreshes the caches.
 
 1. Detects the host (immutable vs mutable), the distro, and the package manager,
    then selects the scope and target paths.
-2. Locates the `.deb` (newest in `~/Downloads`, or one you pass in).
+2. Locates the `.deb`: the newest `CommandCode-*.deb` in `~/Downloads`, one you
+   pass in, or — when none is present — the latest release downloaded from
+   GitHub (prompted, or via `--download`), verified against the release's
+   published sha512.
 3. Unpacks it with `ar x` into a temp dir, then `tar -xf`s the `data.tar.*`
    member (xz/gz/zst auto-detected).
 4. Validates it: architecture, an md5 integrity pass over every file, and the
@@ -216,6 +219,26 @@ refreshes the caches.
 
 Steps 5–6 are elevated with `sudo` for a system-wide install. The temp dir is
 removed on exit, and nothing is swapped into place until every check passes.
+
+## AppImage alternative
+
+Upstream also publishes a Linux **AppImage** (`CommandCode-<ver>-x86_64.AppImage`)
+alongside the `.deb`. If you'd rather not run an installer — or you're on a
+distro outside the Fedora family — you can grab and run it directly:
+
+```bash
+base=https://github.com/CommandCodeAI/desktop/releases/latest/download
+name=$(curl -fsSL "$base/latest-linux.yml" | grep -oE 'CommandCode-[^ ]+x86_64\.AppImage' | head -1)
+curl -fL -o ~/Downloads/"$name" "$base/$name"
+chmod +x ~/Downloads/"$name"
+~/Downloads/"$name"
+```
+
+The AppImage bundles its own runtime and needs no root; it won't appear in the
+app menu unless you add a desktop entry (the AppImage launcher tools can do
+that). This installer deliberately targets the **`.deb`** path so it can lay
+out icons, a desktop entry and a `bin` symlink the way a packaged app would.
+(The AppImage is x86_64-only, same as the `.deb`.)
 
 ## Notes & troubleshooting
 

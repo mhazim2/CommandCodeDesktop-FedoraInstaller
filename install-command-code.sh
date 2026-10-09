@@ -46,7 +46,6 @@ DOWNLOAD_GLOB="CommandCode-*-amd64.deb"
 HOME_DIR="${HOME:?HOME is not set}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME_DIR/.local/share}"
 DOWNLOAD_DIR="$HOME_DIR/Downloads"
-OVERLAY_PKGS_LIST="/var/lib/rakuos/packages.list"
 
 # Upstream release feed (Electron-builder latest-linux.yml lists the .deb with
 # its filename, size and sha512).
@@ -353,6 +352,9 @@ With the detected/default scope ($SCOPE), this installs to:
   binary  $BIN_DIR/$APP_ID  (symlink)
   menu    $DESKTOP_FILE
   icons   $ICON_ROOT/*/apps/$APP_ID.png
+
+Alternative: upstream also publishes a Linux AppImage (x86_64, no install):
+  https://github.com/$DEB_UPSTREAM_REPO/releases/latest
 EOF
 }
 
@@ -412,7 +414,7 @@ collect_required_pkgs() {
 # name. Uses `rum provides` on RakuOS and `dnf repoquery` elsewhere. Falls back
 # to the raw soname if it can't be resolved.
 resolve_so_to_pkg() {
-	local so="$1" cands="" n filtered="" shortest
+	local so="$1" cands="" pick libonly shortest
 	if command -v rum >/dev/null 2>&1; then
 		cands="$(rum provides "${so}()(64bit)" 2>/dev/null \
 			| sed -nE 's/^([^ ]+)-[0-9][^-]*-[^-]*\.(x86_64|noarch|i686|aarch64).*/\1/p' \
@@ -423,17 +425,14 @@ resolve_so_to_pkg() {
 			| sort -u || true)"
 	fi
 	if [ -z "$cands" ]; then printf '%s' "$so"; return; fi
-	# Drop packages the user already installed via the overlay (e.g. a browser
-	# that bundles its own copy of the soname) — they are already present.
-	while IFS= read -r n; do
-		[ -n "$n" ] || continue
-		if [ -f "$OVERLAY_PKGS_LIST" ] && grep -qx "$n" "$OVERLAY_PKGS_LIST" 2>/dev/null; then
-			continue
-		fi
-		filtered="${filtered}${n}"$'\n'
-	done <<< "$cands"
-	[ -n "$filtered" ] || filtered="$cands"
-	shortest="$(printf '%s' "$filtered" | awk 'NF{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2- || true)"
+	# A soname can be "provided" by unrelated apps that merely bundle a copy
+	# (e.g. browsers shipping their own libnss3). Prefer a package that looks
+	# like a library ("lib*"); otherwise fall back to the shortest name. This
+	# is generic across Fedora-family hosts (no RakuOS-specific data needed).
+	pick="$cands"
+	libonly="$(printf '%s\n' "$cands" | awk '/^lib/')"
+	[ -n "$libonly" ] && pick="$libonly"
+	shortest="$(printf '%s\n' "$pick" | awk 'NF{print length, $0}' | sort -n | head -n1 | cut -d' ' -f2- || true)"
 	printf '%s' "${shortest:-$so}"
 }
 
@@ -515,6 +514,7 @@ if [ -z "$DEB" ]; then
 		log "downloaded: $DEB"
 	else
 		shopt -s nullglob
+		# shellcheck disable=SC2206  # intentional glob expansion of $DOWNLOAD_GLOB
 		candidates=( "$DOWNLOAD_DIR"/$DOWNLOAD_GLOB )
 		shopt -u nullglob
 		if [ "${#candidates[@]}" -eq 0 ]; then
@@ -628,7 +628,7 @@ else
 	done < <(find "$TMP/data/opt" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
 fi
 if [ -z "$APP_SRC" ]; then
-	found="$(ls -1 "$TMP/data/opt" 2>/dev/null | paste -sd', ' - || true)"
+	found="$(find "$TMP/data/opt" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | paste -sd', ' - || true)"
 	fail "could not find the app payload inside the .deb" \
 		"Expected 'opt/$APP_NAME' (or a directory containing an executable '$APP_ID')." \
 		"Found under opt/: ${found:-<nothing>}" \
