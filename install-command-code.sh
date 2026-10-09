@@ -2,12 +2,15 @@
 #
 # install-command-code.sh
 #
-# Install the "Command Code" desktop app (Electron) from its upstream .deb
-# onto an immutable bootc/ostree Fedora host, per-user (no root required).
+# Install the "Command Code" desktop app (Electron) from its upstream .deb on
+# Fedora-family systems. The .deb is unpacked directly with `ar` + `tar`
+# (no dpkg needed), so this works equally on:
 #
-# The host image is read-only (/usr is a composefs overlay) and has no dpkg,
-# so this extracts the .deb directly with `ar` + `tar` and lays the payload
-# out under ~/.local, where the XDG launcher picks it up.
+#   * immutable ostree/bootc hosts (Fedora Silverblue/Kinoite, Bazzite,
+#     RakuOS, ...) -> per-user install under ~/.local (no root needed);
+#   * ordinary mutable hosts (Fedora, RHEL, CentOS Stream, AlmaLinux,
+#     Rocky Linux, Oracle Linux, ...) -> system-wide install under /usr/local
+#     (uses sudo).
 #
 # Idempotent: re-running replaces the existing install cleanly.
 #
@@ -20,15 +23,18 @@
 #   * On a terminal it pauses at the end so you can read the message.
 #
 # Usage:
-#   ./install-command-code.sh                  # newest deb from ~/Downloads
-#   ./install-command-code.sh path/to/app.deb   # a specific deb
-#   ./install-command-code.sh --deb app.deb     # same, explicit flag
-#   ./install-command-code.sh --uninstall       # remove the per-user install
+#   ./install-command-code.sh                    # newest deb from ~/Downloads
+#   ./install-command-code.sh path/to/app.deb     # a specific deb
+#   ./install-command-code.sh --user              # force per-user install
+#   ./install-command-code.sh --system            # force system-wide install
+#   ./install-command-code.sh --uninstall
 #   ./install-command-code.sh --help
 #
 # Options:
+#   --user          install per-user (~/.local), no root needed
+#   --system        install system-wide (/usr/local), uses sudo
 #   --no-verify     skip the md5 integrity check (faster)
-#   --force         install even if libraries are missing / unknowns are found
+#   --force         install even if shared libraries are missing
 #   --no-pause      never wait for Enter on failure (for scripts/cron)
 #
 set -Eeuo pipefail
@@ -39,12 +45,6 @@ DOWNLOAD_GLOB="CommandCode-*-amd64.deb"
 
 HOME_DIR="${HOME:?HOME is not set}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME_DIR/.local/share}"
-
-OPT_DIR="$HOME_DIR/.local/opt/$APP_ID"
-BIN_DIR="$HOME_DIR/.local/bin"
-DESKTOP_DIR="$DATA_HOME/applications"
-DESKTOP_FILE="$DESKTOP_DIR/$APP_ID.desktop"
-ICON_ROOT="$DATA_HOME/icons/hicolor"
 DOWNLOAD_DIR="$HOME_DIR/Downloads"
 OVERLAY_PKGS_LIST="/var/lib/rakuos/packages.list"
 
@@ -53,6 +53,14 @@ DO_UNINSTALL=0
 VERIFY=1
 FORCE=0
 NO_PAUSE="${CC_NO_PAUSE:-0}"
+SCOPE=""          # user | system ; empty = auto-detect
+SUDO=""           # set to "sudo" when a system install needs elevation
+
+# resolved by set_paths()
+OPT_DIR="" BIN_DIR="" DESKTOP_DIR="" DESKTOP_FILE="" ICON_ROOT=""
+
+# OS info (filled from /etc/os-release)
+OS_ID="" OS_LIKE="" OS_PLATFORM="" OS_PRETTY=""
 
 FAILED=0
 TMP=""
@@ -63,6 +71,11 @@ log()  { printf '  %s\n' "$*"; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 note() { printf '\033[36m·\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+
+# Run a command, elevating with sudo for a system-wide install when needed.
+run() {
+	if [ -n "$SUDO" ]; then "$SUDO" "$@"; else "$@"; fi
+}
 
 pause_on_failure() {
 	[ "$NO_PAUSE" = 1 ] && return 0
@@ -111,29 +124,120 @@ on_err() {
 
 cleanup() {
 	[ -n "$TMP" ] && rm -rf "$TMP"
-	[ -n "$STAGE" ] && rm -rf "$STAGE"
+	if [ -n "$STAGE" ]; then run rm -rf "$STAGE" || true; fi
 	return 0
 }
 trap 'on_err "$LINENO"' ERR
 trap cleanup EXIT
 
+# ---- host / distro detection -------------------------------------------------
+if [ -r /etc/os-release ]; then
+	# shellcheck disable=SC1091
+	. /etc/os-release
+	OS_ID="${ID:-}"
+	OS_LIKE="${ID_LIKE:-}"
+	OS_PLATFORM="${PLATFORM_ID:-}"
+	OS_PRETTY="${PRETTY_NAME:-${NAME:-unknown}}"
+fi
+
+# Immutable = /usr is read-only and managed as an image (ostree/bootc).
+is_immutable() {
+	[ -e /run/ostree-booted ] && return 0
+	[ -d /run/ostree/.private ] && return 0
+	[ -e /sysroot/ostree ] && return 0
+	[ -w /usr ] || return 0
+	return 1
+}
+
+# Enterprise Linux family (RHEL, CentOS, Alma, Rocky, Oracle, ...).
+is_el() {
+	case "$OS_PLATFORM" in platform:el[0-9]*) return 0 ;; esac
+	case "$OS_ID" in rhel|centos|almalinux|rocky|ol|oraclelinux) return 0 ;; esac
+	case " $OS_LIKE " in *" rhel "*) return 0 ;; esac
+	return 1
+}
+
+# The command that installs packages on this host (for dependency hints).
+pkg_install_cmd() {
+	if   command -v rum        >/dev/null 2>&1; then echo "sudo rum install"
+	elif command -v rpm-ostree >/dev/null 2>&1; then echo "sudo rpm-ostree install"
+	elif command -v dnf        >/dev/null 2>&1; then echo "sudo dnf install"
+	elif command -v microdnf   >/dev/null 2>&1; then echo "sudo microdnf install"
+	elif command -v yum        >/dev/null 2>&1; then echo "sudo yum install"
+	else echo ""; fi
+}
+
+# Set OPT_DIR/BIN_DIR/... for the chosen scope.
+set_paths() {
+	if [ "$SCOPE" = system ]; then
+		OPT_DIR="/usr/local/opt/$APP_ID"
+		BIN_DIR="/usr/local/bin"
+		DESKTOP_DIR="/usr/local/share/applications"
+		ICON_ROOT="/usr/local/share/icons/hicolor"
+	else
+		OPT_DIR="$HOME_DIR/.local/opt/$APP_ID"
+		BIN_DIR="$HOME_DIR/.local/bin"
+		DESKTOP_DIR="$DATA_HOME/applications"
+		ICON_ROOT="$DATA_HOME/icons/hicolor"
+	fi
+	DESKTOP_FILE="$DESKTOP_DIR/$APP_ID.desktop"
+}
+
+resolve_scope() {
+	[ -n "$SCOPE" ] || { if is_immutable; then SCOPE=user; else SCOPE=system; fi; }
+	set_paths
+}
+
+prepare_privileges() {
+	SUDO=""
+	[ "$SCOPE" = system ] || return 0
+	if [ "$(id -u)" -eq 0 ]; then return 0; fi
+	if command -v sudo >/dev/null 2>&1; then
+		SUDO="sudo"
+		if ! "$SUDO" -v 2>/dev/null; then
+			fail "sudo authentication failed" \
+				"A system-wide install needs root. Re-run as root, or use --user."
+		fi
+		return 0
+	fi
+	fail "a system-wide install needs root" \
+		"Re-run as root, or use --user for a per-user install."
+}
+
+# User-namespace support (lets Electron sandbox without a setuid helper).
+userns_ok() {
+	[ -L /proc/self/ns/user ] || return 1
+	if command -v unshare >/dev/null 2>&1; then
+		unshare --user true 2>/dev/null
+	else
+		return 0
+	fi
+}
+
 usage() {
+	resolve_scope
 	cat <<EOF
-$APP_NAME installer (per-user, idempotent)
+$APP_NAME installer (idempotent)
 
 Usage:
   $(basename "$0") [DEB_PATH]        Install from DEB_PATH (default: newest
                                      $DOWNLOAD_GLOB in $DOWNLOAD_DIR)
   $(basename "$0") --deb DEB_PATH    Install from an explicit .deb path
-  $(basename "$0") --uninstall       Remove the per-user install
+  $(basename "$0") --uninstall       Remove the install (see --user/--system)
   $(basename "$0") --help            Show this help
 
 Options:
+  --user        install per-user under ~/.local (no root)
+  --system      install system-wide under /usr/local (uses sudo)
   --no-verify   skip the md5 integrity check
   --force       install even if shared libraries are missing
   --no-pause    do not wait for Enter when something fails
 
-Installs to:
+Host: ${OS_PRETTY:-unknown}
+$( if is_immutable; then echo "  immutable image -> default scope is --user"; else echo "  mutable host    -> default scope is --system"; fi )
+Packages are installed with: $(pkg_install_cmd || echo "(no known package manager)")
+
+With the detected/default scope ($SCOPE), this installs to:
   app     $OPT_DIR
   binary  $BIN_DIR/$APP_ID  (symlink)
   menu    $DESKTOP_FILE
@@ -143,10 +247,10 @@ EOF
 
 refresh_caches() {
 	if command -v update-desktop-database >/dev/null 2>&1; then
-		update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+		run update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
 	fi
 	if command -v gtk-update-icon-cache >/dev/null 2>&1; then
-		gtk-update-icon-cache -f -t "$ICON_ROOT" >/dev/null 2>&1 || true
+		run gtk-update-icon-cache -f -t "$ICON_ROOT" >/dev/null 2>&1 || true
 	fi
 	if command -v xdg-mime >/dev/null 2>&1; then
 		xdg-mime default "$APP_ID.desktop" x-scheme-handler/commandcode >/dev/null 2>&1 || true
@@ -155,6 +259,8 @@ refresh_caches() {
 
 # ---- dependency helpers ------------------------------------------------------
 # Debian package name -> Fedora/RPM package name (the ones Electron apps need).
+# The same names apply on RHEL/CentOS Stream/Alma/Rocky (libappindicator-gtk3
+# lives in EPEL there).
 map_debian_dep() {
 	case "$1" in
 		libgtk-3-0|libgtk-3-0t64)      echo gtk3 ;;
@@ -172,7 +278,7 @@ map_debian_dep() {
 	esac
 }
 
-# Emit the Fedora package names required by a .deb control file (Depends + Recommends).
+# Emit the Fedora/RPM package names required by a .deb control file.
 collect_required_pkgs() {
 	local control="$1" field line token alt
 	[ -f "$control" ] || return 0
@@ -191,14 +297,20 @@ collect_required_pkgs() {
 	done
 }
 
-# Map a missing shared library (e.g. libnss3.so) to an installable package name
-# using `rum provides`. Falls back to the raw soname if it can't be resolved.
+# Map a missing shared library (e.g. libnss3.so) to an installable package
+# name. Uses `rum provides` on RakuOS and `dnf repoquery` elsewhere. Falls back
+# to the raw soname if it can't be resolved.
 resolve_so_to_pkg() {
 	local so="$1" cands="" n filtered="" shortest
-	if ! command -v rum >/dev/null 2>&1; then printf '%s' "$so"; return; fi
-	cands="$(rum provides "${so}()(64bit)" 2>/dev/null \
-		| sed -nE 's/^([^ ]+)-[0-9][^-]*-[^-]*\.(x86_64|noarch|i686|aarch64).*/\1/p' \
-		| sort -u || true)"
+	if command -v rum >/dev/null 2>&1; then
+		cands="$(rum provides "${so}()(64bit)" 2>/dev/null \
+			| sed -nE 's/^([^ ]+)-[0-9][^-]*-[^-]*\.(x86_64|noarch|i686|aarch64).*/\1/p' \
+			| sort -u || true)"
+	elif command -v dnf >/dev/null 2>&1; then
+		cands="$(timeout 30 dnf -q repoquery --whatprovides "${so}()(64bit)" 2>/dev/null \
+			| sed -nE 's/^([^ ]+)-[0-9][^-]*-[^-]*\.(x86_64|noarch|i686|aarch64).*/\1/p' \
+			| sort -u || true)"
+	fi
 	if [ -z "$cands" ]; then printf '%s' "$so"; return; fi
 	# Drop packages the user already installed via the overlay (e.g. a browser
 	# that bundles its own copy of the soname) — they are already present.
@@ -216,31 +328,36 @@ resolve_so_to_pkg() {
 
 # Print a ready-to-run install command for the given (space-separated) packages.
 print_suggestion() {
-	local list="$1"
+	local list="$1" cmd
 	[ -n "$list" ] || return 0
 	# shellcheck disable=SC2086
 	set -- $list
+	cmd="$(pkg_install_cmd)"
 	printf '    \033[1mSuggested fix:\033[0m\n'
-	if command -v rpm-ostree >/dev/null 2>&1; then
-		printf '      sudo rpm-ostree install %s\n' "$*"
-		printf '      \033[2m(layers into the image; takes effect after a reboot)\033[0m\n'
-	elif command -v rum >/dev/null 2>&1; then
-		printf '      sudo rum install %s\n' "$*"
-		printf '      \033[2m(rum adds this to the RakuOS overlay; persists across image updates)\033[0m\n'
-	elif command -v dnf >/dev/null 2>&1; then
-		printf '      sudo dnf install %s\n' "$*"
-	else
+	if [ -z "$cmd" ]; then
 		printf '      install these packages, then re-run: %s\n' "$*"
+		return 0
+	fi
+	printf '      %s %s\n' "$cmd" "$*"
+	case "$cmd" in
+		*sudo*rum*)        printf '      \033[2m(rum adds this to the RakuOS overlay; persists across image updates)\033[0m\n' ;;
+		*sudo*rpm-ostree*) printf '      \033[2m(layers into the image; takes effect after a reboot)\033[0m\n' ;;
+		*) ;;
+	esac
+	if is_el; then
+		case " $* " in
+			*" libappindicator-gtk3 "*) printf '      \033[2m(libappindicator-gtk3 is in EPEL — enable it first if needed)\033[0m\n' ;;
+		esac
 	fi
 }
 
 do_uninstall() {
-	echo "Uninstalling $APP_NAME (per-user)..."
-	rm -rf "$OPT_DIR"
-	rm -f  "$BIN_DIR/$APP_ID"
-	rm -f  "$DESKTOP_FILE"
+	echo "Uninstalling $APP_NAME ($SCOPE install)..."
+	run rm -rf "$OPT_DIR"
+	run rm -f  "$BIN_DIR/$APP_ID"
+	run rm -f  "$DESKTOP_FILE"
 	if [ -d "$ICON_ROOT" ]; then
-		find "$ICON_ROOT" -type f -name "$APP_ID.png" -delete 2>/dev/null || true
+		run find "$ICON_ROOT" -type f -name "$APP_ID.png" -delete 2>/dev/null || true
 	fi
 	refresh_caches
 	ok "Removed $APP_NAME"
@@ -250,6 +367,8 @@ do_uninstall() {
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 		--uninstall)  DO_UNINSTALL=1; shift ;;
+		--user)       SCOPE=user; shift ;;
+		--system)     SCOPE=system; shift ;;
 		--deb)        [ "$#" -ge 2 ] || fail "--deb requires a path" ; DEB="$2"; shift 2 ;;
 		--no-verify)  VERIFY=0; shift ;;
 		--force)      FORCE=1; shift ;;
@@ -260,10 +379,15 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 
+resolve_scope
+
 if [ "$DO_UNINSTALL" -eq 1 ]; then
+	prepare_privileges
 	do_uninstall
 	exit 0
 fi
+
+prepare_privileges
 
 # ---- locate the .deb ---------------------------------------------------------
 if [ -z "$DEB" ]; then
@@ -295,6 +419,9 @@ done
 
 echo "Installing $APP_NAME from:"
 log "$DEB"
+if is_immutable; then host_kind="immutable image"; else host_kind="mutable host"; fi
+note "host: ${OS_PRETTY:-unknown} ($host_kind) — scope: $SCOPE"
+[ "$SCOPE" = system ] && note "elevating with sudo as needed (target: /usr/local)"
 
 TMP="$(mktemp -d)"
 
@@ -314,12 +441,11 @@ data_member_name="$( printf '%s\n' "$members" | grep -m1 '^data.tar\.' || true )
 	"The file may be corrupt — re-download it."
 
 # ---- read control metadata ---------------------------------------------------
-pkg_version="" arch="" pkg_name=""
+pkg_version="" arch=""
 control_member="$(find "$TMP" -maxdepth 1 -name 'control.tar.*' -print -quit)"
 if [ -n "$control_member" ]; then
 	mkdir -p "$TMP/control"
 	if tar -xf "$control_member" -C "$TMP/control" 2>/dev/null && [ -f "$TMP/control/control" ]; then
-		pkg_name="$(sed -n 's/^Package: *//p'      "$TMP/control/control" | head -n1)"
 		pkg_version="$(sed -n 's/^Version: *//p'   "$TMP/control/control" | head -n1)"
 		arch="$(sed -n 's/^Architecture: *//p' "$TMP/control/control" | head -n1)"
 	fi
@@ -459,14 +585,28 @@ elif [ -n "$missing_pkgs" ]; then
 fi
 
 # ---- stage the new payload (do not touch the working install yet) ------------
-mkdir -p "$(dirname "$OPT_DIR")"
+run mkdir -p "$(dirname "$OPT_DIR")"
 STAGE="$(dirname "$OPT_DIR")/.$APP_ID.stage"
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
-cp -a "$APP_SRC/." "$STAGE/"
-# leave the sandbox non-setuid so Electron uses the kernel namespace sandbox
-chmod 0755 "$STAGE/chrome-sandbox" 2>/dev/null || true
+run rm -rf "$STAGE"
+run mkdir -p "$STAGE"
+run cp -a "$APP_SRC/." "$STAGE/"
 [ -x "$STAGE/$APP_ID" ] || fail "staging failed: '$APP_ID' is not executable after copy"
+
+# Sandbox: prefer the kernel namespace sandbox; fall back to a setuid helper on
+# a system install; otherwise the app must run with --no-sandbox.
+EXEC_ARGS=""
+if userns_ok; then
+	run chmod 0755 "$STAGE/chrome-sandbox" 2>/dev/null || true
+elif [ "$SCOPE" = system ]; then
+	run chown root:root "$STAGE/chrome-sandbox"
+	run chmod 4755 "$STAGE/chrome-sandbox"
+	note "user namespaces unavailable — using the setuid chrome-sandbox helper"
+else
+	EXEC_ARGS="--no-sandbox "
+	warn "user namespaces are unavailable and this is a per-user install, so the"
+	warn "Electron sandbox cannot be enabled; the launcher will pass --no-sandbox."
+	warn "For proper sandboxing re-run with: $(basename "$0") --system"
+fi
 
 # ---- install icons ----------------------------------------------------------
 installed_icons=0
@@ -474,19 +614,20 @@ if [ -d "$TMP/data/usr/share/icons/hicolor" ]; then
 	for dir in "$TMP/data/usr/share/icons/hicolor"/*/apps; do
 		[ -f "$dir/$APP_ID.png" ] || continue
 		icon_size="$(basename "$(dirname "$dir")")"
-		mkdir -p "$ICON_ROOT/$icon_size/apps"
-		cp -a "$dir/$APP_ID.png" "$ICON_ROOT/$icon_size/apps/"
+		run mkdir -p "$ICON_ROOT/$icon_size/apps"
+		run cp -a "$dir/$APP_ID.png" "$ICON_ROOT/$icon_size/apps/"
 		installed_icons=$((installed_icons + 1))
 	done
 fi
 
 # ---- desktop entry ----------------------------------------------------------
-mkdir -p "$DESKTOP_DIR"
-cat > "$DESKTOP_FILE" <<EOF
+run mkdir -p "$DESKTOP_DIR"
+tmp_desktop="$TMP/$APP_ID.desktop"
+cat > "$tmp_desktop" <<EOF
 [Desktop Entry]
 Name=$APP_NAME
 Comment=$APP_NAME desktop app
-Exec=$OPT_DIR/$APP_ID %U
+Exec=$OPT_DIR/$APP_ID ${EXEC_ARGS}%U
 TryExec=$OPT_DIR/$APP_ID
 Terminal=false
 Type=Application
@@ -495,28 +636,29 @@ StartupWMClass=$APP_ID
 MimeType=x-scheme-handler/commandcode;
 Categories=Development;
 EOF
+run cp -f "$tmp_desktop" "$DESKTOP_FILE"
 
-# ---- user binary ------------------------------------------------------------
-mkdir -p "$BIN_DIR"
-ln -sf "$OPT_DIR/$APP_ID" "$BIN_DIR/$APP_ID"
+# ---- binary ------------------------------------------------------------
+run mkdir -p "$BIN_DIR"
+run ln -sf "$OPT_DIR/$APP_ID" "$BIN_DIR/$APP_ID"
 
 # ---- swap in the new payload (last, with rollback) --------------------------
 BACKUP="$(dirname "$OPT_DIR")/.$APP_ID.bak"
-rm -rf "$BACKUP"
+run rm -rf "$BACKUP"
 if [ -e "$OPT_DIR" ]; then
-	mv "$OPT_DIR" "$BACKUP" || fail "could not move the old install aside"
+	run mv "$OPT_DIR" "$BACKUP" || fail "could not move the old install aside"
 fi
-if ! mv "$STAGE" "$OPT_DIR"; then
-	[ -e "$BACKUP" ] && mv "$BACKUP" "$OPT_DIR"
+if ! run mv "$STAGE" "$OPT_DIR"; then
+	[ -e "$BACKUP" ] && run mv "$BACKUP" "$OPT_DIR"
 	fail "failed to move the new payload into place" "Your previous install was restored."
 fi
-rm -rf "$BACKUP"
+run rm -rf "$BACKUP"
 STAGE=""
 
 # ---- caches / mime ----------------------------------------------------------
 refresh_caches
 
-ok "Installed $APP_NAME ${pkg_version:+$pkg_version }to $OPT_DIR"
+ok "Installed $APP_NAME ${pkg_version:+$pkg_version }($SCOPE) to $OPT_DIR"
 echo
 log "binary : $BIN_DIR/$APP_ID"
 log "menu   : $DESKTOP_FILE"

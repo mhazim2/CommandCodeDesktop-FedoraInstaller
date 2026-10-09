@@ -1,64 +1,80 @@
-# Command Code — per-user install on an immutable host
+# Command Code installer (Fedora-family, multi-distro)
 
-This directory contains a self-contained, idempotent installer for the
-**Command Code** desktop app (Electron) on this machine.
+A self-contained, idempotent installer for the **Command Code** desktop app
+(Electron). Upstream ships a Debian `.deb`; this unpacks it directly (a `.deb`
+is just an `ar` archive containing `control.tar.*` + `data.tar.*`) and installs
+it on RPM-based, **Fedora-family** systems — no `dpkg` needed.
 
-## Why an installer instead of `dpkg`/`rpm`
+## Supported hosts
 
-This host is an **immutable bootc / ostree image** (Fedora-based):
+| Host type | Examples | Install scope | Root |
+| --- | --- | --- | --- |
+| **Immutable** image (ostree/bootc) | Fedora Silverblue/Kinoite, Bazzite, RakuOS | per-user under `~/.local` | no |
+| **Mutable** host | Fedora, RHEL, CentOS Stream, AlmaLinux, Rocky Linux, Oracle Linux | system-wide under `/usr/local` | `sudo` |
 
-- `/usr` is a read-only `composefs` overlay — you cannot drop files into
-  `/usr`, `/opt`, `/etc` or `/usr/local` without a root-owned image change.
-- There is **no `dpkg`**, and no `rpm-ostree` for layering local packages
-  (the system uses `bootc`).
-- Upstream ships a Debian `.deb`, which we can still unpack directly — a
-  `.deb` is just an `ar` archive containing `control.tar.*` + `data.tar.*`.
+The default scope is chosen automatically:
 
-So the app is installed **per-user under `~/.local`**, which is writable,
-survives OS updates, needs no root, and is picked up by the XDG app launcher.
+- `/usr` is read-only (or `/run/ostree-booted` exists, or `rpm-ostree` is
+  present) → **per-user**, so nothing has to fight the read-only image.
+- Otherwise → **system-wide** under `/usr/local` (uses `sudo`).
 
-All of the Electron runtime libraries (`libnss3`, `libgtk-3`, `libasound`,
-`libsecret`, `libatspi`, etc.) are already present in the base image — the
-binary reports no missing shared libraries.
+Override with `--user` or `--system` at any time.
 
 ## Quick start
 
 ```bash
 cd ~/"Command Code"
-./install-command-code.sh
+./install-command-code.sh                 # newest CommandCode-*.deb in ~/Downloads
 ```
 
-By default it installs the **newest** `CommandCode-*-amd64.deb` found in
-`~/Downloads`. To install a specific file:
+Specific file, or a forced scope:
 
 ```bash
 ./install-command-code.sh ~/Downloads/CommandCode-0.1.51-amd64.deb
 ./install-command-code.sh --deb /path/to/CommandCode-x.y.z-amd64.deb
+./install-command-code.sh --user          # force per-user
+./install-command-code.sh --system        # force system-wide (sudo)
 ```
 
-Extra flags: `--no-verify` (skip the md5 integrity check), `--force` (install
-even if shared libraries are missing), `--no-pause` (never wait for Enter).
+Flags:
 
-Then launch **Command Code** from the app menu, or run:
+| Flag | Meaning |
+| --- | --- |
+| `--user` / `--system` | force the install scope |
+| `--no-verify` | skip the md5 integrity check |
+| `--force` | install even if shared libraries are missing |
+| `--no-pause` | never wait for Enter when something fails |
 
-```bash
-~/.local/bin/command-code
-```
+Launch **Command Code** from the app menu, or run `command-code`
+(per-user: `~/.local/bin/command-code`, system: `/usr/local/bin/command-code`).
 
-> If the menu entry doesn't appear immediately, log out and back in (or
-> restart your launcher) so it re-reads the XDG desktop database.
+> If the menu entry doesn't appear immediately, log out and back in (or restart
+> your launcher) so it re-reads the XDG desktop database.
 
 ## What gets installed
 
-| Item        | Path                                                     |
-| ----------- | -------------------------------------------------------- |
-| App payload | `~/.local/opt/command-code/`                             |
-| CLI binary  | `~/.local/bin/command-code` → symlink                    |
-| Menu entry  | `~/.local/share/applications/command-code.desktop`       |
-| Icons       | `~/.local/share/icons/hicolor/*/apps/command-code.png`   |
+**Per-user (`--user`, default on immutable hosts):**
 
-The `Exec` line in the desktop entry points at the absolute binary path, and
-the `x-scheme-handler/commandcode` MIME type is registered.
+| Item | Path |
+| --- | --- |
+| App payload | `~/.local/opt/command-code/` |
+| CLI binary | `~/.local/bin/command-code` → symlink |
+| Menu entry | `~/.local/share/applications/command-code.desktop` |
+| Icons | `~/.local/share/icons/hicolor/*/apps/command-code.png` |
+
+**System-wide (`--system`, default on mutable hosts):**
+
+| Item | Path |
+| --- | --- |
+| App payload | `/usr/local/opt/command-code/` |
+| CLI binary | `/usr/local/bin/command-code` → symlink |
+| Menu entry | `/usr/local/share/applications/command-code.desktop` |
+| Icons | `/usr/local/share/icons/hicolor/*/apps/command-code.png` |
+
+`/usr/local/...` is used (rather than `/opt` + `/usr/share`) so nothing is
+tangled up with RPM-managed files. The desktop entry's `Exec` points at the
+absolute binary path, and the `x-scheme-handler/commandcode` MIME type is
+registered.
 
 ## When a new download is broken
 
@@ -76,14 +92,13 @@ It stops like that when it finds:
 - the **app layout changed** upstream (payload dir / executable not found),
 - the app needs **shared libraries that aren't installed** on this host.
 
-On any of these, the existing `~/.local/opt/command-code` is left exactly as
-it was:
+On any of these, the existing install is left exactly as it was:
 
 ```
 ✗ Installation stopped: integrity check failed — the download is corrupt or incomplete
     opt/Command Code/command-code: FAILED
     Re-download the .deb, or re-run with --no-verify to skip this check.
-    Your existing install is intact: /var/home/rakuos/.local/opt/command-code
+    Your existing install is intact: /usr/local/opt/command-code
 ```
 
 Without a terminal (e.g. from a script) it never blocks — it just exits
@@ -91,25 +106,37 @@ non-zero with the same message on stderr.
 
 ## Dependencies & libraries
 
-Before swapping anything in, the installer checks that the app's requirements
-are satisfied on this host:
+Before swapping anything in, the installer checks the app's requirements:
 
-- It reads the `.deb`'s `Depends:`/`Recommends:` fields, translates the Debian
-  package names to their Fedora equivalents (`libnss3` → `nss`, `libgtk-3-0` →
-  `gtk3`, `libxss1` → `libXScrnSaver`, …), and checks each with `rpm -q`.
-- It runs `ldd` on the app binary and collects anything reported as
-  **not found**.
+- It reads the `.deb`'s `Depends:`/`Recommends:`, translates the Debian names
+  to their RPM equivalents (`libnss3` → `nss`, `libgtk-3-0` → `gtk3`,
+  `libxss1` → `libXScrnSaver`, `libasound2` → `alsa-lib`, …), and checks each
+  with `rpm -q`.
+- It runs `ldd` on the app binary and collects anything **not found**.
 
-What it does with that:
+Then:
 
 - **A hard library is missing** (the app would not start) → it stops, lists the
-  libraries, and prints a ready-to-run command. It also resolves each missing
-  soname to an installable package with `rum provides` (e.g. `libXss.so.1` →
-  `libXScrnSaver`); anything no repo provides is listed separately.
-- **Only declared-but-optional deps are missing** (the app starts anyway, some
-  features may be limited) → a non-fatal warning with the same suggestion.
+  libraries, and prints a ready-to-run install command. Each missing soname is
+  resolved to a package (`rum provides` on RakuOS, `dnf repoquery` elsewhere);
+  anything no repo provides is listed separately.
+- **Only declared-but-optional deps are missing** (the app starts anyway) → a
+  non-fatal warning with the same suggestion.
 
-Example output:
+The suggested command matches the host's package manager:
+
+| Package manager | Host | Command |
+| --- | --- | --- |
+| `rum` | RakuOS (overlay, persists across image updates) | `sudo rum install …` |
+| `rpm-ostree` | Fedora Silverblue/Kinoite, CoreOS | `sudo rpm-ostree install …` (reboot) |
+| `dnf` | Fedora, RHEL 8+, CentOS Stream, Alma, Rocky | `sudo dnf install …` |
+| `yum` | RHEL/CentOS 7 | `sudo yum install …` |
+
+On Enterprise Linux, `libappindicator-gtk3` lives in **EPEL**; the script notes
+this when it would be needed. Use `--force` to skip the hard stop and install
+anyway.
+
+Example output (RakuOS):
 
 ```
 ! some declared dependencies are not installed (the app starts without them, but some features may be limited)
@@ -120,11 +147,18 @@ Example output:
       (rum adds this to the RakuOS overlay; persists across image updates)
 ```
 
-Because this host layers packages with **`rum`** (into the RakuOS overlay), the
-suggested command is `sudo rum install …` and the result survives OS image
-updates. On hosts using `rpm-ostree` or plain `dnf` the script prints the
-matching command instead. Use `--force` to skip the hard stop and install
-anyway.
+## Sandbox
+
+Electron's sandbox needs either user namespaces or a setuid helper:
+
+- **User namespaces available** (most modern Fedora/RHEL 8+ with the default
+  kernel settings) → `chrome-sandbox` is left `0755` and the kernel namespace
+  sandbox is used. No root, no setuid.
+- **User namespaces unavailable, system install** → `chrome-sandbox` is made
+  root-owned and mode `4755` (the upstream approach).
+- **User namespaces unavailable, per-user install** → the sandbox can't be
+  enabled, so the desktop entry is written with `--no-sandbox` and a warning is
+  printed. Re-run with `--system` if you want proper sandboxing.
 
 ## Updating
 
@@ -135,13 +169,15 @@ install in place:
 ./install-command-code.sh          # picks up the newest .deb in ~/Downloads
 ```
 
-Remove `~/.local/opt/command-code` first is **not** required; the script does
-that for you.
+Remove the install directory first is **not** required; the script does that for
+you.
 
 ## Uninstalling
 
 ```bash
-./install-command-code.sh --uninstall
+./install-command-code.sh --uninstall            # removes the detected/default scope
+./install-command-code.sh --system --uninstall    # removes the system-wide install
+./install-command-code.sh --user --uninstall      # removes the per-user install
 ```
 
 This removes the payload, the symlink, the menu entry, and the icons, then
@@ -149,30 +185,31 @@ refreshes the caches.
 
 ## How it works
 
-1. Locates the `.deb` (newest in `~/Downloads`, or one you pass in).
-2. Unpacks it with `ar x` into a temp dir, then `tar -xf`s the
-   `data.tar.*` member (xz/gz/zst are auto-detected).
-3. Validates it: architecture, an md5 integrity pass over every file, and a
-   check that the app's shared libraries are present.
-4. Stages the payload next to the install, then atomically swaps it into
-   `~/.local/opt/command-code/` (restoring the old copy if the swap fails).
-5. Installs the hicolor icons and the `.desktop` entry, symlinks
-   `~/.local/bin/command-code`, and refreshes
-   `update-desktop-database` / `gtk-update-icon-cache` / `xdg-mime`.
+1. Detects the host (immutable vs mutable), the distro, and the package manager,
+   then selects the scope and target paths.
+2. Locates the `.deb` (newest in `~/Downloads`, or one you pass in).
+3. Unpacks it with `ar x` into a temp dir, then `tar -xf`s the `data.tar.*`
+   member (xz/gz/zst auto-detected).
+4. Validates it: architecture, an md5 integrity pass over every file, and the
+   shared-library / declared-dependency checks.
+5. Stages the payload next to the install, then atomically swaps it in
+   (restoring the old copy if the swap fails).
+6. Installs the icons and the `.desktop` entry, symlinks the binary, and
+   refreshes `update-desktop-database` / `gtk-update-icon-cache` / `xdg-mime`.
 
-The temp dir is removed automatically on exit, and nothing is swapped into
-place until every check has passed.
+Steps 5–6 are elevated with `sudo` for a system-wide install. The temp dir is
+removed on exit, and nothing is swapped into place until every check passes.
 
 ## Notes & troubleshooting
 
-- **`chrome-sandbox`** is left mode `0755` (not setuid). This host has
-  unprivileged user namespaces enabled, so Electron uses the kernel namespace
-  sandbox — no root and no setuid bit needed.
+- **RHEL/CentOS/Alma/Rocky**: the runtime library names match Fedora, so the
+  dependency mapping works as-is; `libappindicator-gtk3` is in EPEL.
 - **`vaInitialize failed: unknown libva error`** on startup is a harmless
   GPU/VA-API warning; the app falls back to software rendering and works fine.
-- **Command not found in a shell**: ensure `~/.local/bin` is in your `PATH`.
-- **No menu entry**: confirm `~/.local/share/applications/command-code.desktop`
-  exists and is valid with `desktop-file-validate ~/.local/share/applications/command-code.desktop`.
+- **Command not found in a shell**: add `~/.local/bin` (or `/usr/local/bin`) to
+  your `PATH`.
+- **No menu entry**: validate the desktop file with
+  `desktop-file-validate <path>/command-code.desktop`.
 
 ## Files here
 
